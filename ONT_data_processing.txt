@@ -1,0 +1,153 @@
+#script by Edward Gilbert, 2024. 
+
+###BASECALLING
+# "Dorado" is now the preferred basecaller for ONT data from .pod5 format. It calls the bases and demultiplexes the barcodes. The "Super Accurate Caller" (SUP) takes some computational power but seems to outperform the other models by a significant degree.
+
+# SUP basecalling:
+dorado basecaller sup pod5/ --barcode-both-ends --kit-name SQK-NBD114-96 > basecalled/calls_sup_both.bam
+
+# demultiplexing SUP:
+dorado demux basecalled/calls_sup_both.bam --barcode-both-ends --kit-name SQK-NBD114-96 -t 6 --output-dir demuxed/demux_sup_temp1_fastq --emit-fastq
+
+###QUALITY CONTROL
+#"fastp" to check quality and filter out low quality reads (Q<15), using a loop to go through each barcode. Make sure you are in the conda environment.
+
+# Loop through each barcode
+for barcode in {01..88}; do
+    # Define the input and output filenames
+    input_filename="SQK-NBD114-96_barcode${barcode}.fastq"
+    output_filename="fastp/SQK-NBD114-96_barcode${barcode}_filtered.fastq"
+
+    # Run fastp to filter the reads
+    fastp \
+        -i "$input_filename" \
+        -o "$output_filename" \
+        --qualified_quality_phred 15 \
+        --html "${output_filename%.fastq}.html" \
+        --json "${output_filename%.fastq}.json"
+done
+
+###MAPPING
+#Now we need to map the filtered reads onto the reference library. The reference library has already been constructed and indexed (.mmi and .fai). First make sure you are in a conda environment with minimap2
+#This code maps, sorts, and converts (check directories)
+minimap2 -ax map-ont #FILE.mmi #FILEfiltered_fastqs/*.fastq | \
+samtools view -S -b -t #Reference_lib.fas | samtools sort -o #OUTPUT.bam
+
+#COVERAGE
+samtools depth barcode01.bam > barcode01.coverage
+
+#if an index file is needed
+samtools index barcode01.bam
+
+# Loop through each barcode
+for barcode in {01..88}; do
+    # Define the input BAM filename
+    input_bam="barcode${barcode}.bam"
+
+    # Define the output coverage filename
+    output_coverage="barcode${barcode}.coverage"
+
+    # Calculate coverage using samtools depth
+    samtools depth "$input_bam" > "$output_coverage"
+done
+
+#extract mapped and unmapped reads from BAM file if needed
+samtools view -b -F 4 06mappedsorted.bam > 06mapped.bam
+samtools view -b -f 4 06mappedsorted.bam > 06unmapped.bam
+
+# Loop through each barcode
+for barcode in {01..88}; do
+    # Define the input BAM filename
+    input_bam="barcode${barcode}.bam"
+
+    # Define the output mapped BAM filename
+    output_mapped_bam="coverage/mapped_only/barcode${barcode}_mapped.bam"
+
+    # Extract mapped reads using samtools view
+    samtools view -b -F 4 "$input_bam" > "$output_mapped_bam"
+done
+
+###BCFTOOLS VARIANTS AND CONSENSUS
+#generate haplotype and indel aware consensus sequences, which can all be processed using bcftools. I've set up a loop to work through all the barcodes. This will generate a .fasta file for each consensus sequence.
+#to loop through all the barcodes and tidy up your directories by placing files in appropriate folders:
+
+# Set paths and directories
+reference_genome="#Reference_lib.fas"
+bam_directory="#/mapped/named/"
+pileup_directory="#bcftools_mpileups"
+variant_directory="#bcftools_variant_files"
+consensus_directory="#bcftools_consensus"
+
+# Loop over .bam files in the current directory
+for bam_file in *.bam; do
+    # Generate pileup file
+    pileup_file="${pileup_directory}/${bam_file%.bam}.pileup.bcf"
+    bcftools mpileup -Ou -f "${reference_genome}" "${bam_file}" > "${pileup_file}"
+
+    # Perform variant calling
+    variant_file="${variant_directory}/${bam_file%.bam}.variants.vcf"
+    bcftools call -Ov -mv -o "${variant_file}" "${pileup_file}"
+
+    # Normalize variants
+    normalized_variant_file="${variant_directory}/${bam_file%.bam}.normalized_variants.vcf"
+    bcftools norm -f "${reference_genome}" -Ov -o "${normalized_variant_file}" "${variant_file}"
+
+    # Compress and index normalized VCF file
+    bgzip "${normalized_variant_file}"
+    tabix -p vcf "${normalized_variant_file}.gz"
+
+    # Generate haplotype-aware consensus sequences for both haplotypes
+    consensus_file_h1="${consensus_directory}/${bam_file%.bam}_H1.consensus.fasta"
+    bcftools consensus -f "${reference_genome}" -H 1 -o "${consensus_file_h1}" "${normalized_variant_file}.gz"
+
+    consensus_file_h2="${consensus_directory}/${bam_file%.bam}_H2.consensus.fasta"
+    bcftools consensus -f "${reference_genome}" -H 2 -o "${consensus_file_h2}" "${normalized_variant_file}.gz"
+done
+
+##FILTERING VCF
+#Exclude SNPs that are of low quality and could influence downstream analyses:
+#'FMT/DP<3' exclude genotype calls informed by less than 3 reads
+#AVG(FMT/DP)<3 in cases of hetergenous depth among samples, filter by mean genotype depth across all samples. Remove SNPS with mean genotype depth less than 3.
+#AN/2<2 exclude SNPs when not all samples have sequence data. Total number of alleles in genotypes (AN). Remove SNPs genotypes for less than 2 individuals.
+#QUAL<20 exclude SNPs based on the value of the QUAL field.
+#other useful filters that could be applied:
+#-e 'INFO/DP<10' exclude depth less than 10
+#-e 'MQ<40' exclude mapping quality less than 40
+#-e 'MAF<0.05' exclude minor allele frequency below 5% (e.g. in instances of sequencing error vs. genuine SNPS)
+#consider that these are dependent on whether all samples are in the same vcf
+
+bcftools merge -Oz -o merged_spatial.vcf.gz *variants.vcf.gz --missing-to-ref
+
+bcftools filter -S . -e 'FMT/DP<10' merged_spatial.vcf.gz | \
+bcftools filter --exclude 'MAF<0.05' | \
+bcftools view -e 'AVG(FMT/DP)<10 || QUAL<30 || AN/2<2' -O z > \
+filtered_spatial.vcf.gz
+
+
+# This could result in quite a dramatic reduction in the number of SNPs, check the amount left
+bcftools view -H filtered.vcf | wc -l
+
+###DECONVOLUTING TARGET REGIONS AND PUT INTO ALIGNMENT
+#Loop to include the gene names and the reference:
+# Loop over consensus fasta files
+for consensus_file in *_H*.consensus.fasta; do
+    # Extract barcode and haplotype from file name
+    barcode=$(echo "${consensus_file}" | cut -d '_' -f 1)
+    haplotype=$(echo "${consensus_file}" | cut -d '_' -f 2 | cut -d '.' -f 1)
+
+    # Read consensus fasta file
+    while IFS= read -r line; do
+        # Check if the line is a header (starts with '>')
+        if [[ $line == ">"* ]]; then
+            # Extract gene region name from header
+            gene_region=$(echo "$line" | cut -d '>' -f 2)
+            # Create output fasta file for the gene region
+            output_file="Aligned_genes/${gene_region}.fasta"
+            # Append barcode and haplotype information to the header
+            echo ">${barcode}_${haplotype}" >> "${output_file}"
+        else
+            # Append sequence to the output fasta file
+            echo "$line" >> "${output_file}"
+        fi
+    done < "${consensus_file}"
+done
